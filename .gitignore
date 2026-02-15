@@ -1,0 +1,21 @@
+# Build artifacts
+sumatrapdf/
+artifact/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+
+# IDE
+.vs/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+.DS_Store
+.tmp.driveupload/
+
+# OneDrive sync artifacts
+~$*

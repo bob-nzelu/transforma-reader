@@ -1,0 +1,117 @@
+name: Build Transforma Reader
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Transforma Reader
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Clone SumatraPDF source
+        run: |
+          if (-not (Test-Path "sumatrapdf")) {
+            git clone --depth 1 --branch 3.5.2 https://github.com/nicbenji/sumatrapdf.git sumatrapdf
+          }
+        shell: pwsh
+
+      - name: Copy Helium source into SumatraPDF
+        run: |
+          # Copy our Helium integration files into the Sumatra source tree
+          Copy-Item -Recurse -Force "src/helium" "sumatrapdf/src/helium"
+
+          # Copy the integration patch (modifies Sumatra's toolbar)
+          if (Test-Path "src/patches/SumatraIntegration.cpp") {
+            Copy-Item "src/patches/SumatraIntegration.cpp" "sumatrapdf/src/SumatraIntegration.cpp"
+          }
+        shell: pwsh
+
+      - name: Apply build configuration
+        run: |
+          # Add Helium source files to SumatraPDF's build
+          $vcxproj = "sumatrapdf/vs2022/SumatraPDF.vcxproj"
+          if (Test-Path $vcxproj) {
+            $content = Get-Content $vcxproj -Raw
+
+            # Add our .cpp files to the compilation
+            $heliumFiles = @"
+    <ClCompile Include="..\src\helium\RelayClient.cpp" />
+    <ClCompile Include="..\src\helium\SessionToken.cpp" />
+    <ClCompile Include="..\src\helium\InvoiceRouter.cpp" />
+    <ClCompile Include="..\src\helium\DuplicateCache.cpp" />
+    <ClCompile Include="..\src\helium\HeliumController.cpp" />
+    <ClCompile Include="..\src\SumatraIntegration.cpp" />
+"@
+            # Insert before the closing ItemGroup that contains ClCompile
+            $content = $content -replace '(</ItemGroup>\s*<ItemGroup>\s*<ClInclude)', "$heliumFiles`n  `$1"
+            Set-Content $vcxproj $content
+          }
+        shell: pwsh
+
+      - name: Build SumatraPDF (Release x64)
+        run: |
+          cd sumatrapdf
+          # SumatraPDF uses its own build system - try premake first, fall back to MSBuild
+          if (Test-Path "premake5.lua") {
+            # Download premake5 if needed
+            if (-not (Test-Path "bin/premake5.exe")) {
+              Invoke-WebRequest -Uri "https://github.com/nicbenji/sumatrapdf/releases/latest/download/premake5.exe" -OutFile "premake5.exe" -ErrorAction SilentlyContinue
+              if (-not (Test-Path "premake5.exe")) {
+                # Fallback: use the premake bundled in repo
+                Copy-Item "bin/premake5.exe" "premake5.exe" -ErrorAction SilentlyContinue
+              }
+            }
+            ./premake5.exe vs2022
+          }
+
+          # Build with MSBuild
+          $slnFiles = Get-ChildItem -Path "vs2022" -Filter "*.sln" -ErrorAction SilentlyContinue
+          if ($slnFiles) {
+            msbuild $slnFiles[0].FullName /p:Configuration=Release /p:Platform=x64 /m
+          } else {
+            # Alternative: build the vcxproj directly
+            $vcxFiles = Get-ChildItem -Path "vs2022" -Filter "SumatraPDF.vcxproj" -ErrorAction SilentlyContinue
+            if ($vcxFiles) {
+              msbuild $vcxFiles[0].FullName /p:Configuration=Release /p:Platform=x64 /m
+            } else {
+              Write-Error "No solution or project file found in vs2022/"
+              exit 1
+            }
+          }
+        shell: pwsh
+
+      - name: Package artifact
+        run: |
+          mkdir -Force artifact
+
+          # Find the built executable
+          $exe = Get-ChildItem -Recurse -Filter "SumatraPDF.exe" -Path "sumatrapdf" |
+                 Where-Object { $_.DirectoryName -match "Release" } |
+                 Select-Object -First 1
+
+          if ($exe) {
+            Copy-Item $exe.FullName "artifact/TransformaReader.exe"
+            Write-Host "Built: $($exe.FullName) -> artifact/TransformaReader.exe"
+          } else {
+            Write-Error "Build output not found"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TransformaReader-x64
+          path: artifact/TransformaReader.exe
+          retention-days: 30
