@@ -2,9 +2,10 @@ name: Build Transforma Reader
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, 'claude/**']
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -13,98 +14,128 @@ jobs:
     steps:
       - name: Checkout Transforma Reader
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
+      - name: Cache SumatraPDF source
+        id: cache-sumatra
+        uses: actions/cache@v4
+        with:
+          path: sumatrapdf
+          key: sumatrapdf-3.5.2rel-v1
+
       - name: Clone SumatraPDF source
+        if: steps.cache-sumatra.outputs.cache-hit != 'true'
         run: |
-          if (-not (Test-Path "sumatrapdf")) {
-            git clone --depth 1 --branch 3.5.2 https://github.com/nicbenji/sumatrapdf.git sumatrapdf
-          }
+          git clone --depth 1 --branch 3.5.2rel https://github.com/sumatrapdfreader/sumatrapdf.git sumatrapdf
         shell: pwsh
 
-      - name: Copy Helium source into SumatraPDF
+      - name: Copy Helium source into SumatraPDF tree
         run: |
-          # Copy our Helium integration files into the Sumatra source tree
           Copy-Item -Recurse -Force "src/helium" "sumatrapdf/src/helium"
+          Copy-Item -Force "src/patches/SumatraIntegration.cpp" "sumatrapdf/src/SumatraIntegration.cpp"
 
-          # Copy the integration patch (modifies Sumatra's toolbar)
-          if (Test-Path "src/patches/SumatraIntegration.cpp") {
-            Copy-Item "src/patches/SumatraIntegration.cpp" "sumatrapdf/src/SumatraIntegration.cpp"
-          }
+          Write-Host "Helium files copied:"
+          Get-ChildItem "sumatrapdf/src/helium" | ForEach-Object { Write-Host "  $_" }
+          Write-Host "  sumatrapdf/src/SumatraIntegration.cpp"
         shell: pwsh
 
-      - name: Apply build configuration
+      - name: Patch SumatraPDF project to include Helium
         run: |
-          # Add Helium source files to SumatraPDF's build
           $vcxproj = "sumatrapdf/vs2022/SumatraPDF.vcxproj"
-          if (Test-Path $vcxproj) {
-            $content = Get-Content $vcxproj -Raw
+          [xml]$xml = Get-Content $vcxproj
 
-            # Add our .cpp files to the compilation
-            $heliumFiles = @"
-    <ClCompile Include="..\src\helium\RelayClient.cpp" />
-    <ClCompile Include="..\src\helium\SessionToken.cpp" />
-    <ClCompile Include="..\src\helium\InvoiceRouter.cpp" />
-    <ClCompile Include="..\src\helium\DuplicateCache.cpp" />
-    <ClCompile Include="..\src\helium\HeliumController.cpp" />
-    <ClCompile Include="..\src\SumatraIntegration.cpp" />
-"@
-            # Insert before the closing ItemGroup that contains ClCompile
-            $content = $content -replace '(</ItemGroup>\s*<ItemGroup>\s*<ClInclude)', "$heliumFiles`n  `$1"
-            Set-Content $vcxproj $content
+          $nsUri = "http://schemas.microsoft.com/developer/msbuild/2003"
+          $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+          $ns.AddNamespace("ms", $nsUri)
+
+          # --- 1. Add Helium .cpp files to the ClCompile ItemGroup ---
+          $compileGroup = $xml.SelectSingleNode("//ms:ItemGroup[ms:ClCompile]", $ns)
+          if (-not $compileGroup) {
+            Write-Error "Could not find ClCompile ItemGroup in vcxproj"
+            exit 1
           }
+
+          $heliumCppFiles = @(
+            "..\src\helium\HeliumController.cpp",
+            "..\src\helium\RelayClient.cpp",
+            "..\src\helium\SessionToken.cpp",
+            "..\src\helium\InvoiceRouter.cpp",
+            "..\src\helium\DuplicateCache.cpp",
+            "..\src\SumatraIntegration.cpp"
+          )
+
+          foreach ($file in $heliumCppFiles) {
+            $elem = $xml.CreateElement("ClCompile", $nsUri)
+            $elem.SetAttribute("Include", $file)
+            $compileGroup.AppendChild($elem) | Out-Null
+            Write-Host "  Added ClCompile: $file"
+          }
+
+          # --- 2. Add Helium .h files to ClInclude ItemGroup ---
+          $includeGroup = $xml.SelectSingleNode("//ms:ItemGroup[ms:ClInclude]", $ns)
+          if ($includeGroup) {
+            $heliumHeaders = @(
+              "..\src\helium\HeliumController.h",
+              "..\src\helium\RelayClient.h",
+              "..\src\helium\SessionToken.h",
+              "..\src\helium\InvoiceRouter.h",
+              "..\src\helium\DuplicateCache.h"
+            )
+            foreach ($file in $heliumHeaders) {
+              $elem = $xml.CreateElement("ClInclude", $nsUri)
+              $elem.SetAttribute("Include", $file)
+              $includeGroup.AppendChild($elem) | Out-Null
+            }
+            Write-Host "  Added ClInclude headers"
+          }
+
+          # --- 3. Add winhttp.lib and crypt32.lib to link dependencies ---
+          $linkDeps = $xml.SelectNodes("//ms:ItemDefinitionGroup/ms:Link/ms:AdditionalDependencies", $ns)
+          $libsAdded = 0
+          foreach ($dep in $linkDeps) {
+            $current = $dep.InnerText
+            if ($current -notmatch 'winhttp\.lib') {
+              $dep.InnerText = "winhttp.lib;crypt32.lib;$current"
+              $libsAdded++
+            }
+          }
+          Write-Host "  Added link libraries to $libsAdded configurations"
+
+          # --- Save patched project ---
+          $xml.Save((Resolve-Path $vcxproj).Path)
+          Write-Host "Successfully patched $vcxproj"
         shell: pwsh
 
-      - name: Build SumatraPDF (Release x64)
+      - name: Build Release x64
         run: |
-          cd sumatrapdf
-          # SumatraPDF uses its own build system - try premake first, fall back to MSBuild
-          if (Test-Path "premake5.lua") {
-            # Download premake5 if needed
-            if (-not (Test-Path "bin/premake5.exe")) {
-              Invoke-WebRequest -Uri "https://github.com/nicbenji/sumatrapdf/releases/latest/download/premake5.exe" -OutFile "premake5.exe" -ErrorAction SilentlyContinue
-              if (-not (Test-Path "premake5.exe")) {
-                # Fallback: use the premake bundled in repo
-                Copy-Item "bin/premake5.exe" "premake5.exe" -ErrorAction SilentlyContinue
-              }
-            }
-            ./premake5.exe vs2022
-          }
-
-          # Build with MSBuild
-          $slnFiles = Get-ChildItem -Path "vs2022" -Filter "*.sln" -ErrorAction SilentlyContinue
-          if ($slnFiles) {
-            msbuild $slnFiles[0].FullName /p:Configuration=Release /p:Platform=x64 /m
-          } else {
-            # Alternative: build the vcxproj directly
-            $vcxFiles = Get-ChildItem -Path "vs2022" -Filter "SumatraPDF.vcxproj" -ErrorAction SilentlyContinue
-            if ($vcxFiles) {
-              msbuild $vcxFiles[0].FullName /p:Configuration=Release /p:Platform=x64 /m
-            } else {
-              Write-Error "No solution or project file found in vs2022/"
-              exit 1
-            }
-          }
+          msbuild sumatrapdf/vs2022/SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /m /v:normal
         shell: pwsh
 
       - name: Package artifact
         run: |
-          mkdir -Force artifact
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
 
-          # Find the built executable
-          $exe = Get-ChildItem -Recurse -Filter "SumatraPDF.exe" -Path "sumatrapdf" |
-                 Where-Object { $_.DirectoryName -match "Release" } |
+          # SumatraPDF Release x64 output goes to out/rel64/
+          $exe = Get-ChildItem -Recurse -Filter "SumatraPDF.exe" -Path "sumatrapdf/out" -ErrorAction SilentlyContinue |
                  Select-Object -First 1
+
+          if (-not $exe) {
+            # Fallback: search entire build tree
+            $exe = Get-ChildItem -Recurse -Filter "SumatraPDF.exe" -Path "sumatrapdf" -ErrorAction SilentlyContinue |
+                   Where-Object { $_.DirectoryName -match "Release|rel" } |
+                   Select-Object -First 1
+          }
 
           if ($exe) {
             Copy-Item $exe.FullName "artifact/TransformaReader.exe"
-            Write-Host "Built: $($exe.FullName) -> artifact/TransformaReader.exe"
+            $sizeMB = [math]::Round($exe.Length / 1MB, 2)
+            Write-Host "Packaged: $($exe.FullName) -> artifact/TransformaReader.exe ($sizeMB MB)"
           } else {
-            Write-Error "Build output not found"
+            Write-Error "SumatraPDF.exe not found after build. Build output:"
+            Get-ChildItem -Recurse -Path "sumatrapdf/out" -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host $_.FullName }
             exit 1
           }
         shell: pwsh
