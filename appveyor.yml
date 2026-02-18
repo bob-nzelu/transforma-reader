@@ -85,6 +85,11 @@ build_script:
       $xml.Save((Resolve-Path $vcxproj).Path)
       Write-Host "Successfully patched $vcxproj"
 
+      # Suppress new MSVC 17.14 enum-conversion warnings (C5286, C5287) that
+      # upstream SumatraPDF code (mupdf, dav1d) hasn't fixed yet.
+      # The CL env-var is prepended to every cl.exe invocation.
+      $env:CL = "/wd5286 /wd5287"
+
       # Build
       msbuild sumatrapdf/vs2022/SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /m /v:normal
 
