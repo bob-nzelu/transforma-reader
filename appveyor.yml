@@ -1,0 +1,111 @@
+version: 1.0.{build}
+
+image: Visual Studio 2022
+
+environment:
+  SUMATRA_BRANCH: 3.5.2rel
+
+cache:
+  - sumatrapdf -> appveyor.yml
+
+install:
+  - ps: |
+      if (-not (Test-Path "sumatrapdf")) {
+        git clone --depth 1 --branch $env:SUMATRA_BRANCH https://github.com/sumatrapdfreader/sumatrapdf.git sumatrapdf
+      }
+
+build_script:
+  - ps: |
+      # Copy Helium source into SumatraPDF tree
+      Copy-Item -Recurse -Force "src/helium" "sumatrapdf/src/helium"
+      Copy-Item -Force "src/patches/SumatraIntegration.cpp" "sumatrapdf/src/SumatraIntegration.cpp"
+
+      Write-Host "Helium files copied:"
+      Get-ChildItem "sumatrapdf/src/helium" | ForEach-Object { Write-Host "  $_" }
+
+      # Patch vcxproj to include Helium files
+      $vcxproj = "sumatrapdf/vs2022/SumatraPDF.vcxproj"
+      [xml]$xml = Get-Content $vcxproj
+
+      $nsUri = "http://schemas.microsoft.com/developer/msbuild/2003"
+      $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+      $ns.AddNamespace("ms", $nsUri)
+
+      # Add Helium .cpp files
+      $compileGroup = $xml.SelectSingleNode("//ms:ItemGroup[ms:ClCompile]", $ns)
+      if (-not $compileGroup) {
+        Write-Error "Could not find ClCompile ItemGroup"
+        exit 1
+      }
+
+      $heliumCppFiles = @(
+        "..\src\helium\HeliumController.cpp",
+        "..\src\helium\RelayClient.cpp",
+        "..\src\helium\SessionToken.cpp",
+        "..\src\helium\InvoiceRouter.cpp",
+        "..\src\helium\DuplicateCache.cpp",
+        "..\src\SumatraIntegration.cpp"
+      )
+
+      foreach ($file in $heliumCppFiles) {
+        $elem = $xml.CreateElement("ClCompile", $nsUri)
+        $elem.SetAttribute("Include", $file)
+        $compileGroup.AppendChild($elem) | Out-Null
+        Write-Host "  Added ClCompile: $file"
+      }
+
+      # Add Helium .h files
+      $includeGroup = $xml.SelectSingleNode("//ms:ItemGroup[ms:ClInclude]", $ns)
+      if ($includeGroup) {
+        $heliumHeaders = @(
+          "..\src\helium\HeliumController.h",
+          "..\src\helium\RelayClient.h",
+          "..\src\helium\SessionToken.h",
+          "..\src\helium\InvoiceRouter.h",
+          "..\src\helium\DuplicateCache.h"
+        )
+        foreach ($file in $heliumHeaders) {
+          $elem = $xml.CreateElement("ClInclude", $nsUri)
+          $elem.SetAttribute("Include", $file)
+          $includeGroup.AppendChild($elem) | Out-Null
+        }
+        Write-Host "  Added ClInclude headers"
+      }
+
+      # Add winhttp.lib and crypt32.lib to link dependencies
+      $linkDeps = $xml.SelectNodes("//ms:ItemDefinitionGroup/ms:Link/ms:AdditionalDependencies", $ns)
+      foreach ($dep in $linkDeps) {
+        $current = $dep.InnerText
+        if ($current -notmatch 'winhttp\.lib') {
+          $dep.InnerText = "winhttp.lib;crypt32.lib;$current"
+        }
+      }
+
+      $xml.Save((Resolve-Path $vcxproj).Path)
+      Write-Host "Successfully patched $vcxproj"
+
+      # Build
+      msbuild sumatrapdf/vs2022/SumatraPDF.sln /p:Configuration=Release /p:Platform=x64 /m /v:normal
+
+after_build:
+  - ps: |
+      New-Item -ItemType Directory -Force -Path artifact | Out-Null
+
+      $exe = Get-ChildItem -Recurse -Filter "SumatraPDF.exe" -Path "sumatrapdf/out" -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+
+      if ($exe) {
+        Copy-Item $exe.FullName "artifact/TransformaReader.exe"
+        $sizeMB = [math]::Round($exe.Length / 1MB, 2)
+        Write-Host "Packaged: artifact/TransformaReader.exe ($sizeMB MB)"
+      } else {
+        Write-Error "SumatraPDF.exe not found after build"
+        exit 1
+      }
+
+artifacts:
+  - path: artifact/TransformaReader.exe
+    name: TransformaReader-x64
+
+platform: x64
+configuration: Release
