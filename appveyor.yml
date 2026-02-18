@@ -10,8 +10,10 @@ cache:
 
 install:
   - ps: |
+      $ErrorActionPreference = 'Continue'
       if (-not (Test-Path "sumatrapdf")) {
-        git clone --depth 1 --branch $env:SUMATRA_BRANCH https://github.com/sumatrapdfreader/sumatrapdf.git sumatrapdf
+        git clone --depth 1 --branch $env:SUMATRA_BRANCH https://github.com/sumatrapdfreader/sumatrapdf.git sumatrapdf 2>&1 | Write-Host
+        if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE" }
       }
 
 build_script:
